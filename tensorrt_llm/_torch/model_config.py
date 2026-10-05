@@ -326,6 +326,11 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        # Fused expert reduction can change accumulation order between runs.
+        if (os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+                or os.getenv("FORCE_MOE_KERNEL_DETERMINISTIC", "0") == "1"):
+            self.moe_disable_finalize_fusion = True
+
         if self.pretrained_config and self.sparse_attention_config:
             # Sparse geometry can come from the checkpoint. Resolve it once so
             # cache allocation, CUDA-graph routing, and model layers all read
