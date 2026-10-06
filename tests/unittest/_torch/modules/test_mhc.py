@@ -1194,6 +1194,74 @@ def _make_fused_hc_runner_case(n: int, hidden_size: int, hc_mult: int, seed: int
     return runner, inputs
 
 
+@pytest.mark.parametrize("num_tokens", [1, 129])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+@pytest.mark.parametrize("fuse_norm", [False, True])
+def test_mhc_fused_hc_force_deterministic(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int, hidden_size: int, fuse_norm: bool
+) -> None:
+    """Deterministic dispatch must survive cached atomic tactics and graph replay."""
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    runner, inputs = _make_fused_hc_runner_case(num_tokens, hidden_size, 4, seed=73)
+    inputs[0].mul_(hidden_size)
+    inputs[1].mul_(hidden_size)
+    inputs[4].mul_(500)
+    # A pre-existing autotune cache may contain a split-K tactic. The public
+    # deterministic path must not execute it, including at a cache hit.
+    if _mhc_fused_hc_mma_available():
+        cached_tactic = ("fused_half_mma", 0, 4, 256, 1)
+    else:
+        cached_tactic = ("fused_all_fma", 2, 2, 0, 1)
+    monkeypatch.setattr(
+        mhc_cuda.AutoTuner.get(), "choose_one", lambda *args, **kwargs: (runner, cached_tactic)
+    )
+    norm_weight = (
+        torch.randn(hidden_size, dtype=torch.bfloat16, device="cuda") * 0.1 + 1
+        if fuse_norm
+        else None
+    )
+
+    def run(values: list[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        return mhc_cuda.mhc_fused_hc(
+            *values,
+            n=4,
+            hidden_size=hidden_size,
+            rms_eps=runner.rms_eps,
+            hc_pre_eps=runner.hc_pre_eps,
+            hc_sinkhorn_eps=runner.hc_sinkhorn_eps,
+            hc_post_mult_value=runner.hc_post_mult_value,
+            sinkhorn_repeat=runner.sinkhorn_repeat,
+            norm_weight=norm_weight,
+            norm_eps=1e-6,
+        )
+
+    expected = tuple(t.clone() for t in run(inputs))
+    for _ in range(10):
+        for actual, reference in zip(run(inputs), expected, strict=True):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    # Every row is independent: moving a row to a one-token decode shape
+    # must not change the arithmetic selected by deterministic dispatch.
+    row = num_tokens // 2
+    single_inputs = [v[row : row + 1].clone() for v in inputs[:4]] + inputs[4:]
+    for actual, reference in zip(run(single_inputs), expected, strict=True):
+        torch.testing.assert_close(actual, reference[row : row + 1], rtol=0, atol=0)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run(inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(inputs)
+    graph.replay()
+    for actual, reference in zip(captured, expected, strict=True):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "backend,num_k_splits,tile_m,expected_shapes",
     [
