@@ -225,7 +225,12 @@ class Compressor(nn.Module):
         # Project input to KV and score in the checkpoint dtype. The compressor
         # kernels accept bf16 or fp32 kv_score and convert values to fp32
         # internally for state updates and online-softmax accumulation.
-        kv_score = F.linear(x.to(self.wkv_gate.weight.dtype), self.wkv_gate.weight)
+        projected_input = x.to(self.wkv_gate.weight.dtype)
+        if os.environ.get("FORCE_DETERMINISTIC") == "1":
+            # Use the same per-token reduction for prefill and cached decode.
+            kv_score = self.wkv_gate(projected_input)
+        else:
+            kv_score = F.linear(projected_input, self.wkv_gate.weight)
 
         # Allocate output buffer
         kv_comp = torch.empty(total_num_comp_tokens, self.head_dim, device=x.device, dtype=x.dtype)

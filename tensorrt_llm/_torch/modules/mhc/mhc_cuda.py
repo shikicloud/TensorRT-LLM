@@ -251,6 +251,7 @@ _BIGFUSE_BLOCK_SIZE_OPTIONS = (128, 256, 512)
 #   tile_m:  FMA M-tile (only used for "fma" backend, 0 otherwise)
 #   bigfuse_bs: BigFuse block size {128, 256, 512}
 _FALLBACK_TACTIC = ("fma", 0, 0, 0)
+_DETERMINISTIC_PRE_MAPPING_TACTIC = ("fma", 1, 1, 256)
 
 
 class MhcPreMappingRunner(TunableRunner):
@@ -465,13 +466,16 @@ def mhc_pre_mapping_fused(
         sinkhorn_repeat=sinkhorn_repeat,
     )
 
-    tuner = AutoTuner.get()
-    _, best_tactic = tuner.choose_one(
-        "trtllm::mhc_pre_mapping",
-        [runner],
-        MhcPreMappingRunner.tuning_config,
-        [x, w_t, residual, hc_scale, hc_base],
-    )
+    if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+        best_tactic = _DETERMINISTIC_PRE_MAPPING_TACTIC
+    else:
+        tuner = AutoTuner.get()
+        _, best_tactic = tuner.choose_one(
+            "trtllm::mhc_pre_mapping",
+            [runner],
+            MhcPreMappingRunner.tuning_config,
+            [x, w_t, residual, hc_scale, hc_base],
+        )
 
     return runner(
         inputs=[x, w_t, residual, hc_scale, hc_base],
@@ -1154,6 +1158,8 @@ def mhc_hc_head_cuda(
         mult,
         K,
         w_t=fn_t,
+        tile_n=1 if os.getenv("FORCE_DETERMINISTIC", "0") == "1" else 0,
+        tile_m=1,
     )
 
     out = torch.empty((M, hidden_size), dtype=torch.bfloat16, device=x.device)

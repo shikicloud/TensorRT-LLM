@@ -26,6 +26,8 @@ from tensorrt_llm._torch.utils import (ActType_TrtllmGen, Fp4QuantizedTensor,
                                        last_positive_power_of_2,
                                        next_positive_power_of_2)
 
+from tensorrt_llm._utils import get_sm_version
+
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
 
@@ -1223,6 +1225,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
     runner_dict = dict()
     tuning_config = None
+    deterministic_tactics = dict()
 
     def __init__(self,
                  num_experts: int,
@@ -1278,6 +1281,24 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                 instance_key] = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(
                     self.act_type, True)
         return MxE4m3MxE2m1BlockScaleMoERunner.runner_dict[instance_key]
+
+    def get_deterministic_tactic(self, hidden_size: int) -> List[int]:
+        valid_hidden = self.valid_hidden_size or hidden_size
+        valid_intermediate = self.valid_intermediate_size or self.intermediate_size
+        key = (torch.cuda.current_device(), self.act_type, self.top_k,
+               hidden_size, self.intermediate_size, self.local_num_experts,
+               valid_hidden, valid_intermediate)
+        if key not in self.deterministic_tactics:
+            # Query one canonical row count so tile selection and the compiled
+            # GEMM/activation configuration are independent of runtime M.
+            candidates = self.get_runner().get_valid_configs(
+                self.top_k, hidden_size, self.intermediate_size,
+                self.local_num_experts, 1, valid_hidden, valid_intermediate)
+            if not candidates:
+                raise RuntimeError("No deterministic MXFP4/MXFP8 MoE tactic is available")
+            self.deterministic_tactics[key] = max(
+                candidates, key=lambda tactic: (tactic[0], -tactic[1]))
+        return self.deterministic_tactics[key]
 
     def forward(
         self,
@@ -1475,6 +1496,18 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         tune_max_num_tokens=tune_max_num_tokens,
         use_dp=use_dp,
     )
+
+    if os.environ.get("FORCE_DETERMINISTIC") == "1" and get_sm_version() in (100, 103):
+        result = kernel_runner([
+            routing_logits, routing_bias, hidden_states, hidden_states_scale,
+            gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha,
+            gemm1_beta, gemm1_clamp_limit, gemm2_weights, gemm2_weights_scale,
+            gemm2_bias, topk_weights, topk_ids],
+            tactic=kernel_runner.get_deterministic_tactic(hidden_states.shape[1]),
+            output=output)
+        if output is not None:
+            return torch.empty(0, device=result.device, dtype=result.dtype)
+        return result
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
     routing_logits_for_tuner, topk_weights_for_tuner, topk_ids_for_tuner, tuning_config_with_hook = \

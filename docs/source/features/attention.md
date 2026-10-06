@@ -48,14 +48,28 @@ This implementation supports BF16 Q/K/V and KV cache, head dimensions 64, 128
 and 256, 32- or 64-token KV pages, at most 32 query heads per KV head,
 a full causal attention window, and beam width 1.
 
+On SM100/SM103, the separate `deterministic_sparse_mla` library supports
+DeepSeek-V4 with BF16 query and KV cache, a 512-element latent vector and
+64-element interleaved RoPE. It processes sliding-window and compressed KV
+indices with the same per-query FP32 reduction in both phases, including
+attention sinks. Context uses standalone RoPE and paged-cache preprocessing;
+generation reuses the cache update performed by the MLA caller.
+Quantized KV cache, fused quantized output epilogues, other MLA algorithms,
+cross-attention and speculative decoding retain their existing implementations.
+The setting does not provide a prefill/generation equivalence guarantee for
+those paths.
+
 `FORCE_DETERMINISTIC=1` also selects this attention library. In the PyTorch
 backend it additionally uses a fixed K reduction for unquantized BF16 linear
-layers, including local tensor-parallel shards, and for `Qwen3NextGate` and
-`DeepseekV3Gate` router projections. The DeepSeek V3 gate, also used by
-Nemotron-H, retains FP32 router output. BF16 CUTLASS MoE on
+layers, including local tensor-parallel shards, and for `Qwen3NextGate`,
+`DeepseekV3Gate` and `DeepseekV4Gate` router projections. The DeepSeek gates,
+also used by Nemotron-H, retain FP32 router output. BF16 CUTLASS MoE on
 SM100/SM103 uses a common fallback GEMM tactic across token counts and disables
 fused finalize. This keeps the expert GEMM and activation arithmetic identical
 when an autotuning cache contains different tactics for prefill and decode.
+TRTLLM-Gen MXFP4/MXFP8 experts on SM100/SM103 also use one compiled GEMM and
+activation configuration selected at a canonical token count, bypassing the
+shape-specific autotuning cache.
 
 With `allreduce_strategy="NCCL"`, BF16, FP16 and FP32 tensor-parallel reductions
 gather rank contributions and add them in rank order using FP32 accumulators.

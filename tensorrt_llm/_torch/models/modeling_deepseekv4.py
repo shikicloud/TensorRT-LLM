@@ -1479,6 +1479,15 @@ class DeepseekV4Gate(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (
+            os.getenv("FORCE_DETERMINISTIC") == "1"
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+        ):
+            from ..modules.deterministic_linear import deterministic_linear
+
+            return deterministic_linear(hidden_states, self.weight, output_dtype=torch.float32)
         return torch.ops.trtllm.dsv3_router_gemm_op(
             hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
         )

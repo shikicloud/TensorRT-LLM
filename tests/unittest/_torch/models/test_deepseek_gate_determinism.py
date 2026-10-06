@@ -6,13 +6,17 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Gate
+from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4Gate
 
 
 @pytest.mark.parametrize("hidden,experts", [(2688, 128), (4096, 256), (7168, 256)])
-def test_deepseek_gate_deterministic_fp32_projection(monkeypatch, hidden, experts):
+@pytest.mark.parametrize("version", [3, 4])
+def test_deepseek_gate_deterministic_fp32_projection(monkeypatch, hidden, experts, version):
     monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
     torch.manual_seed(99)
-    gate = DeepseekV3Gate(
+    gate_class = DeepseekV3Gate if version == 3 else DeepseekV4Gate
+    extra = {} if version == 3 else {"is_hashed": False}
+    gate = gate_class(
         hidden,
         experts,
         top_k=8,
@@ -20,6 +24,7 @@ def test_deepseek_gate_deterministic_fp32_projection(monkeypatch, hidden, expert
         topk_group=1,
         routed_scaling_factor=1.0,
         dtype=torch.bfloat16,
+        **extra,
     ).cuda()
     gate.weight.copy_(torch.randn_like(gate.weight) * 0.02)
     x = torch.randn(640, hidden, device="cuda", dtype=torch.bfloat16)

@@ -1194,6 +1194,78 @@ def _make_fused_hc_runner_case(n: int, hidden_size: int, hc_mult: int, seed: int
     return runner, inputs
 
 
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+def test_mhc_pre_mapping_and_head_force_deterministic(monkeypatch, hidden_size):
+    """Pre-mapping and the final head retain the same arithmetic at every M."""
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    data = generate_realistic_pre_data(257, 4, hidden_size)
+
+    def reject_cached_tactic(*args, **kwargs):
+        raise AssertionError("Deterministic pre-mapping must bypass the autotune cache")
+
+    monkeypatch.setattr(mhc_cuda.AutoTuner.get(), "choose_one", reject_cached_tactic)
+
+    def pre(x):
+        return mhc_cuda.mhc_pre_mapping_fused(
+            x.flatten(1),
+            data["fn"],
+            x,
+            4,
+            data["hc_scale"],
+            data["hc_base"],
+            hidden_size,
+            data["rms_eps"],
+            data["hc_pre_eps"],
+            data["hc_sinkhorn_eps"],
+            data["hc_post_mult_value"],
+            data["sinkhorn_repeat"],
+        )
+
+    def head(x):
+        return mhc_cuda.mhc_hc_head_cuda(
+            x,
+            data["fn"][:4],
+            data["hc_scale"][:1],
+            data["hc_base"][:4],
+            4,
+            hidden_size,
+            norm_eps=data["rms_eps"],
+            eps=data["hc_pre_eps"],
+        )
+
+    x = data["residual"]
+    expected = (*pre(x), head(x))
+    for row in (0, 16, 128, 256):
+        single = x[row : row + 1].clone()
+        for actual, reference in zip((*pre(single), head(single)), expected, strict=True):
+            torch.testing.assert_close(actual, reference[row : row + 1], rtol=0, atol=0)
+
+    reference = vanilla_pre_mapping(
+        x,
+        data["fn"],
+        data["hc_scale"],
+        data["hc_base"],
+        4,
+        data["rms_eps"],
+        data["hc_pre_eps"],
+        data["hc_sinkhorn_eps"],
+        data["hc_post_mult_value"],
+        data["sinkhorn_repeat"],
+    )
+    for actual, ref in zip(expected[:3], reference, strict=True):
+        torch.testing.assert_close(actual.reshape_as(ref), ref, rtol=0.008, atol=0.002)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = (*pre(x), head(x))
+    x.mul_(0.5)
+    graph.replay()
+    for actual, ref in zip(captured, (*pre(x), head(x)), strict=True):
+        torch.testing.assert_close(actual, ref, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 129])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("fuse_norm", [False, True])
