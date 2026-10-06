@@ -70,12 +70,18 @@ class DeterministicFmha(FlashInferTrtllmGenFmha):
     def _run_attention(self, phase: FmhaPhase, **kwargs) -> None:
         query = kwargs["query"]
         fixed_q = kwargs.get("q_len_per_req") or 0
+        seq_lens = kwargs["seq_lens"]
+        if phase == FmhaPhase.CONTEXT:
+            # PhasedFmha keeps the generation tail in the context length view.
+            # The preprocessed Q, page tables and output contain context rows
+            # only; launching for the tail would read/write past those rows.
+            seq_lens = seq_lens[: kwargs["batch_size"]]
         deterministic_attention(
             query=query,
             key_cache=kwargs["kv_cache"][0],
             value_cache=kwargs["kv_cache"][1],
             block_tables=kwargs["block_tables"],
-            seq_lens=kwargs["seq_lens"],
+            seq_lens=seq_lens,
             cu_query_lens=kwargs.get("cum_seq_lens_q"),
             fixed_query_len=fixed_q,
             max_query_len=kwargs.get("max_q_len") or fixed_q,

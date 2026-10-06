@@ -7,6 +7,8 @@ import math
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.deterministic import DeterministicFmha
+from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -19,6 +21,50 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+
+
+@pytest.mark.parametrize("contexts", [1, 3])
+@pytest.mark.parametrize("generations", [1, 2])
+def test_context_attention_ignores_generation_length_tail(contexts: int, generations: int) -> None:
+    """The context phase must not launch kernels for the decode metadata tail."""
+    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
+        pytest.skip("Requires SM100 or SM103")
+    torch.manual_seed(20261006)
+    heads, kv_heads, dim, page = 4, 2, 64, 32
+    context_lengths = [3 + 2 * i for i in range(contexts)]
+    num_context_tokens = sum(context_lengths)
+    total = num_context_tokens + generations
+    query = torch.randn(total, heads, dim, device="cuda", dtype=torch.bfloat16)
+    keys = torch.randn(
+        contexts + generations, kv_heads, page, dim, device="cuda", dtype=torch.bfloat16
+    )
+    values = torch.randn_like(keys)
+    tables = torch.arange(contexts + generations, device="cuda", dtype=torch.int32)[:, None]
+    lengths = torch.tensor(context_lengths + [9] * generations, device="cuda", dtype=torch.int32)
+    cu_q = torch.tensor(
+        [0] + context_lengths + [1] * generations, device="cuda", dtype=torch.int32
+    ).cumsum(0).int()
+    output = torch.full_like(query, 123)
+    expected = torch.empty_like(query[:num_context_tokens])
+    common = dict(
+        query=query[:num_context_tokens], kv_cache=(keys, values),
+        block_tables=tables, batch_size=contexts, max_q_len=max(context_lengths),
+        cum_seq_lens_q=cu_q, bmm1_scale=dim**-0.5, uses_shared_paged_kv_idx=True,
+    )
+    # Allocate valid backing storage for the decode tail so a buggy launch
+    # deterministically overwrites the canary instead of poisoning CUDA.
+    DeterministicFmha._run_attention(
+        None, FmhaPhase.CONTEXT, **common, seq_lens=lengths,
+        out=output[:num_context_tokens],
+    )
+    DeterministicFmha._run_attention(
+        None, FmhaPhase.CONTEXT, **common, seq_lens=lengths[:contexts], out=expected,
+    )
+    torch.testing.assert_close(output[:num_context_tokens], expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        output[num_context_tokens:], torch.full_like(output[num_context_tokens:], 123),
+        rtol=0, atol=0,
+    )
 
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
