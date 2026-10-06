@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from test_prefill_decode_consistency_gpu import _make_checkpoint
+from test_prefill_decode_consistency_gpu import _configure_determinism, _make_checkpoint
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.sampling_params import LogitsProcessor
@@ -40,17 +40,34 @@ class _CaptureAndForceTokens(LogitsProcessor):
 
 
 @pytest.mark.parametrize("cuda_graph", [False, True])
-def test_fixed_tokens_across_cache_boundaries(tmp_path: Path, cuda_graph: bool) -> None:
+@pytest.mark.parametrize("deterministic", [False, True], ids=["default", "deterministic"])
+def test_fixed_tokens_across_cache_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_graph: bool,
+    deterministic: bool,
+) -> None:
+    _configure_determinism(monkeypatch, deterministic)
     model = tmp_path / "model"
     _make_checkpoint(model)
     response = [41, 52, 63, 74, 85, 96, 107, 118]
     baseline: dict[int, torch.Tensor] = {}
-    for chunked, reuse in ((False, False), (True, False), (False, True), (True, True)):
+    # FORCE_DETERMINISTIC disables prefix reuse in the executor creator.
+    # Exercise exact chunk/graph arithmetic under that policy; the default
+    # mode separately verifies actual prefix hits and history preservation.
+    modes = ((False, False), (True, False))
+    if not deterministic:
+        modes += ((False, True), (True, True))
+    for chunked, reuse in modes:
         mode = f"chunk{int(chunked)}-reuse{int(reuse)}"
         with LLM(
             model=str(model),
             backend="pytorch",
-            attn_backend="FlashInfer",
+            attn_backend="TRTLLM" if deterministic else "FlashInfer",
+            env_overrides={
+                "FORCE_DETERMINISTIC": "1" if deterministic else "0",
+                "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "0",
+            },
             max_batch_size=1,
             max_seq_len=512,
             max_num_tokens=128 if chunked else 512,
@@ -117,8 +134,9 @@ def test_fixed_tokens_across_cache_boundaries(tmp_path: Path, cuda_graph: bool) 
                     scores = torch.tensor([row["score"] for row in records[contexts - 1 :]])
                     if not chunked and not reuse and phase == "cold":
                         baseline[length] = scores
-                    # BF16 tolerance for this fixed two-layer checkpoint only.
-                    torch.testing.assert_close(scores, baseline[length], rtol=0, atol=0.01)
+                    torch.testing.assert_close(
+                        scores, baseline[length], rtol=0, atol=0 if deterministic else 0.01
+                    )
                 if not chunked and not reuse and length == 257:
                     # Keep the last prompt token and continuation fixed, but change
                     # the cached prefix. This checkpoint must distinguish its history.

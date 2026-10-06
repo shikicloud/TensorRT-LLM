@@ -31,6 +31,9 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/test_deterministic_linear.py
+  - unittest/_torch/models/test_qwen3_next_gate_determinism.py
+  - unittest/_torch/models/test_deepseek_gate_determinism.py
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_nvfp4_horizontal_producer.py
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py
@@ -175,6 +178,8 @@ l0_b200:
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_bf16_deterministic_tactic_independent_of_token_count
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_runner_cache_preserves_finalize_policy
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_mxfp8_quantized_tensor_handoff

@@ -47,7 +47,18 @@ def _make_checkpoint(path: Path) -> None:
     tokenizer.save_pretrained(path)
 
 
-def test_prefill_decode_consistency_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _configure_determinism(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+    if enabled and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Deterministic TRTLLM attention requires SM100 or SM103")
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1" if enabled else "0")
+    monkeypatch.delenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", raising=False)
+
+
+@pytest.mark.parametrize("deterministic", [False, True], ids=["default", "deterministic"])
+def test_prefill_decode_consistency_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, deterministic: bool
+) -> None:
+    _configure_determinism(monkeypatch, deterministic)
     source = (
         Path(__file__).resolve().parents[3] / "examples/llm-api/llm_prefill_decode_consistency.py"
     )
@@ -61,7 +72,18 @@ def test_prefill_decode_consistency_probe(tmp_path: Path, monkeypatch: pytest.Mo
     prompts.write_text(json.dumps([{"id": "boundary", "prompt_token_ids": [17, 63, 129, 12, 71]}]))
     output = tmp_path / "report.json"
     config = tmp_path / "config.json"
-    config.write_text(json.dumps({"kv_cache_config": {"free_gpu_memory_fraction": 0.05}}))
+    config.write_text(
+        json.dumps(
+            {
+                "attn_backend": "TRTLLM" if deterministic else "FlashInfer",
+                "kv_cache_config": {"free_gpu_memory_fraction": 0.05},
+                "env_overrides": {
+                    "FORCE_DETERMINISTIC": "1" if deterministic else "0",
+                    "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "0",
+                },
+            }
+        )
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -87,7 +109,7 @@ def test_prefill_decode_consistency_probe(tmp_path: Path, monkeypatch: pytest.Mo
             "--temperature",
             "0",
             "--max-abs-dlogprob",
-            "0.01",
+            "0" if deterministic else "0.01",
         ],
     )
     probe.main()
@@ -107,7 +129,10 @@ def test_prefill_decode_consistency_probe(tmp_path: Path, monkeypatch: pytest.Mo
     assert summary["prefill_boundary_vs_full_prefill"]["token_count"] == 6
     assert summary["prefill_repeatability"]["token_count"] == 48
     assert summary["prefill_repeatability"]["max_abs_delta"] == 0
-    # This tolerance covers BF16 rounding in this fixed two-layer checkpoint.
-    # It is not a claim of bitwise equality for arbitrary serving models.
-    assert summary["decode_vs_prefill"]["max_abs_delta"] < 0.01
-    assert summary["prefill_boundary_vs_full_prefill"]["max_abs_delta"] < 0.01
+    if deterministic:
+        assert summary["decode_vs_prefill"]["max_abs_delta"] == 0
+        assert summary["prefill_boundary_vs_full_prefill"]["max_abs_delta"] == 0
+    else:
+        # BF16 tolerance for this fixed two-layer checkpoint only.
+        assert summary["decode_vs_prefill"]["max_abs_delta"] < 0.01
+        assert summary["prefill_boundary_vs_full_prefill"]["max_abs_delta"] < 0.01

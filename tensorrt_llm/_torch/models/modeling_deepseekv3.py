@@ -896,6 +896,14 @@ class DeepseekV3Gate(nn.Module):
             is_fused=fuse_routing_kernel)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (os.environ.get("FORCE_DETERMINISTIC", "0") == "1"
+                and hidden_states.dtype == torch.bfloat16
+                and self.weight.dtype == torch.bfloat16):
+            from ..modules.deterministic_linear import deterministic_linear
+
+            return deterministic_linear(hidden_states, self.weight,
+                                          output_dtype=torch.float32)
+
         if (self.use_cute_dsl_bf16_gemm and is_sm_100f()
                 and self.weight.dtype == torch.bfloat16):
             input_2d = hidden_states.view(-1, hidden_states.shape[-1])

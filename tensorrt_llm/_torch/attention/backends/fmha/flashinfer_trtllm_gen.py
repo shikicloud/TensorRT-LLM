@@ -39,6 +39,7 @@ Example:
 """
 
 import math
+import os
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -325,6 +326,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     An attention backend using pure trtllm-gen kernels from flashinfer.
     """
 
+    _supports_deterministic = False
+
     # Default KV layout for flashinfer
     # HND = [max_num_pages, kv_factor, num_kv_heads, page_size, head_dim]
     DEFAULT_KV_LAYOUT = "HND"
@@ -393,6 +396,17 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        if not cls._supports_deterministic and (
+            os.getenv("FORCE_DETERMINISTIC") == "1"
+            or os.getenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC") == "1"
+        ):
+            # This API cannot request a fixed KV reduction. Leave selection
+            # to the deterministic FMHA library or the existing fallback.
+            logger.debug(
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: deterministic attention is enabled."
+            )
+            return False
+
         if not IS_FLASHINFER_AVAILABLE:
             logger.debug("FlashInfer TRTLLM-Gen FMHA is unavailable: flashinfer is not installed.")
             return False
@@ -596,7 +610,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         has_low_precision_kv_cache = kv_cache_dtype in (DataType.FP8, DataType.NVFP4)
 
         if (
-            phase in (None, FmhaPhase.CONTEXT)
+            not self._supports_deterministic
+            and phase in (None, FmhaPhase.CONTEXT)
             and not has_low_precision_kv_cache
             and q.dtype == torch.bfloat16
             and 0 < meta.num_contexts <= 4
@@ -1003,7 +1018,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if params.is_cross
             else AttentionMaskType(fwd.mask_type) == AttentionMaskType.causal
         )
-        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+        self._run_attention(
+            FmhaPhase.CONTEXT,
             query=q_processed,
             kv_cache=(kv_pool, kv_pool),
             workspace_buffer=fmha_workspace,
@@ -1164,7 +1180,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
         gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
 
-        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        self._run_attention(
+            FmhaPhase.GENERATION,
             query=q_processed,
             kv_cache=(kv_pool, kv_pool),
             workspace_buffer=fmha_workspace,
@@ -1191,6 +1208,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             ),
             multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
+
+    def _run_attention(self, phase: FmhaPhase, **kwargs) -> None:
+        if phase == FmhaPhase.CONTEXT:
+            flashinfer.prefill.trtllm_batch_context_with_kv_cache(**kwargs)
+        else:
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache(**kwargs)
 
     def run_mla_generation(
         self,
