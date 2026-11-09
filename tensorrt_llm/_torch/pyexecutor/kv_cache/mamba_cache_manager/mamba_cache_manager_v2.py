@@ -1174,8 +1174,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def mamba_layer_cache(self, layer_idx: int) -> MambaLayerCache:
-        if self._speculative_state is not None and self.spec_config is not None:
-            return self._speculative_state.make_layer_cache(
+        state = self._speculative_state
+        if state is not None and (
+            self.spec_config is not None or getattr(state, "provides_layer_cache", False)
+        ):
+            return state.make_layer_cache(
                 self.mamba_layer_offsets[layer_idx],
                 self.get_conv_states(layer_idx),
                 self.get_ssm_states(layer_idx),

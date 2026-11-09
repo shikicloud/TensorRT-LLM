@@ -449,6 +449,20 @@ class Mamba2Metadata:
                                             dtype=torch.long,
                                             device="cuda")
 
+        # Exact-replay rows of this step (see exact_replay.py), filled by
+        # prepare() when the cache manager exposes its slot token counts.
+        self.replay_pos = torch.zeros(max_batch_size,
+                                      dtype=torch.long,
+                                      device="cuda")
+        self.replay_has_boundary = torch.zeros(max_batch_size,
+                                               dtype=torch.bool,
+                                               device="cuda")
+        self.replay_conv_has_initial = torch.ones(max_batch_size,
+                                                  dtype=torch.bool,
+                                                  device="cuda")
+        self.replay_prefill_n_pre: list[int] = []
+        self.replay_prefill_has_boundary: list[bool] = []
+
     def _prepare_replay_work_items(self, kv_cache_manager, batch_size: int,
                                    num_contexts: int):
         self.replay_num_decodes = 0
@@ -734,6 +748,13 @@ class Mamba2Metadata:
             self.query_start_loc = None
             self.query_start_loc_long = self._arange_buffer_long[:batch_size +
                                                                  1]
+
+        replay_counter = getattr(kv_cache_manager, "mamba_replay_num_tokens",
+                                 None)
+        if replay_counter is not None and batch_size > 0:
+            from .exact_replay import prepare_exact_replay_rows
+            prepare_exact_replay_rows(self, replay_counter, batch_size,
+                                      num_contexts, context_lens)
 
         self.inforward_split = None
         plan = getattr(kv_cache_manager, "inforward_snapshot_plan", None)

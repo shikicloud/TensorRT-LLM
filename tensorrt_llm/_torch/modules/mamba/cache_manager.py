@@ -17,6 +17,7 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
+from tensorrt_llm._torch.modules.mamba.exact_replay import pin_ssd_autotune_configs
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
@@ -142,6 +143,15 @@ class Mamba2LayerCache(MambaLayerCache):
     old_B: torch.Tensor | None = None
     old_dt: torch.Tensor | None = None
     old_dA_cumsum: torch.Tensor | None = None
+    # Exact replay (FORCE_DETERMINISTIC): inputs of the partial chunk after
+    # the boundary state held in `temporal`, and the slot's token count.
+    replay_x: torch.Tensor | None = None
+    replay_dt: torch.Tensor | None = None
+    replay_B: torch.Tensor | None = None
+    replay_num_tokens: torch.Tensor | None = field(
+        default=None,
+        metadata={"slot_shared": True},
+    )
 
 
 def mamba_seed_rank_offset(mapping: Mapping) -> int:
@@ -435,6 +445,87 @@ class ReplayHistory:
         self.old_dA_cumsum = None
 
 
+class Mamba2ExactReplayState:
+    """Boundary-state semantics for FORCE_DETERMINISTIC (see exact_replay.py).
+
+    `temporal` holds each slot's FP32 state at its last chunk boundary; the
+    replay buffers hold the post-conv `x`, raw `dt` and post-conv `B` of the
+    tokens after it, and `replay_num_tokens` counts the tokens a slot has run.
+    """
+
+    uses_replay = False
+    provides_layer_cache = True
+    intermediate_indices = None
+    intermediate_ssm = None
+    intermediate_conv = None
+
+    def __init__(self, chunk_size: int) -> None:
+        self.chunk_size = chunk_size
+        self.replay_x: torch.Tensor | None = None
+        self.replay_dt: torch.Tensor | None = None
+        self.replay_B: torch.Tensor | None = None
+        self.replay_num_tokens: torch.Tensor | None = None
+
+    @staticmethod
+    def bytes_per_slot(context: MambaStateLayout, chunk_size: int) -> int:
+        num_heads, head_dim, d_state = context.ssm_state_shape
+        per_token = num_heads * head_dim + num_heads + context.n_groups_per_rank * d_state
+        return (
+            len(context.mamba_pp_layers)
+            * chunk_size
+            * per_token
+            * context.conv_state_dtype.itemsize
+        )
+
+    def bind(
+        self,
+        context: MambaStateLayout,
+        ssm_states: list[torch.Tensor],
+        conv_states: list[torch.Tensor],
+    ) -> None:
+        if not context.mamba_pp_layers:
+            return
+        cache_size = ssm_states[0].shape[0]
+        device = ssm_states[0].device
+        num_heads, head_dim, d_state = context.ssm_state_shape
+        shape = [len(context.mamba_pp_layers), cache_size, self.chunk_size]
+        dtype = context.conv_state_dtype
+        self.replay_x = torch.zeros(shape + [num_heads, head_dim], dtype=dtype, device=device)
+        self.replay_dt = torch.zeros(shape + [num_heads], dtype=dtype, device=device)
+        self.replay_B = torch.zeros(
+            shape + [context.n_groups_per_rank, d_state], dtype=dtype, device=device
+        )
+        self.replay_num_tokens = torch.zeros(cache_size, dtype=torch.int32, device=device)
+        pin_ssd_autotune_configs()
+
+    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
+        # Context requests include resumed chunked prefills, whose counts must
+        # survive; a request without cached tokens restarts its count in
+        # Mamba2Metadata.prepare instead.
+        return
+
+    def update(self, batch: MambaAcceptanceBatch) -> None:
+        return
+
+    def shutdown(self) -> None:
+        self.replay_x = None
+        self.replay_dt = None
+        self.replay_B = None
+        self.replay_num_tokens = None
+
+    def make_layer_cache(
+        self, layer_offset: int, conv: torch.Tensor, temporal: torch.Tensor
+    ) -> MambaLayerCache:
+        return Mamba2LayerCache(
+            conv=conv,
+            temporal=temporal,
+            replay_x=self.replay_x[layer_offset],
+            replay_dt=self.replay_dt[layer_offset],
+            replay_B=self.replay_B[layer_offset],
+            replay_num_tokens=self.replay_num_tokens,
+        )
+
+
 def create_mamba2_state(
     *, spec_config: object | None, use_replay: bool, stochastic_rounding: bool = False
 ) -> Mamba2State | ReplayHistory:
@@ -479,17 +570,58 @@ def select_mamba2_state(
 class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
     """Nemotron/Mamba2 geometry, replay selection and seed ownership."""
 
-    _speculative_state: Mamba2State | ReplayHistory
+    _speculative_state: Mamba2State | ReplayHistory | Mamba2ExactReplayState
 
     @override
     def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:
         self._mamba_ssm_stochastic_rounding = kwargs.pop("mamba_ssm_stochastic_rounding", False)
+        self._mamba_chunk_size = kwargs.pop("mamba_chunk_size", None)
         self._requested_replay = use_replay_state_update
         kwargs.setdefault("conv_state_layout", "x_b_c")
         super().__init__(*args, **kwargs)
 
+    def _exact_replay_state(self) -> Mamba2ExactReplayState | None:
+        """The FORCE_DETERMINISTIC replay state, or None with the reason logged."""
+        if os.environ.get("FORCE_DETERMINISTIC", "0") != "1":
+            return None
+        if self.spec_config is not None:
+            reason = "speculative decoding is enabled"
+        elif self.ssm_state_dtype != torch.float32:
+            reason = f"mamba_ssm_cache_dtype is {self.ssm_state_dtype}; set it to float32"
+        elif get_sm_version() not in (100, 103):
+            reason = "it is implemented for SM100 and SM103 only"
+        elif not self._mamba_chunk_size:
+            reason = "the Mamba2 chunk size is unknown"
+        else:
+            logger.info_once(
+                "FORCE_DETERMINISTIC: Mamba2 decode replays the chunked-scan arithmetic from "
+                "each sequence's last chunk boundary",
+                key="mamba2_exact_replay",
+            )
+            return Mamba2ExactReplayState(self._mamba_chunk_size)
+        logger.warning_once(
+            f"FORCE_DETERMINISTIC: Mamba2 keeps the default prefill and decode kernels because {reason}",
+            key="mamba2_exact_replay_disabled",
+        )
+        return None
+
+    @property
+    def mamba_replay_num_tokens(self) -> torch.Tensor | None:
+        state = getattr(self, "_speculative_state", None)
+        return state.replay_num_tokens if isinstance(state, Mamba2ExactReplayState) else None
+
     @override
-    def _initialize_spec_state(self) -> Mamba2State | ReplayHistory:
+    def _extra_scratch_bytes_per_slot(self) -> int:
+        state = getattr(self, "_speculative_state", None)
+        if isinstance(state, Mamba2ExactReplayState):
+            return Mamba2ExactReplayState.bytes_per_slot(self._state_layout, state.chunk_size)
+        return super()._extra_scratch_bytes_per_slot()
+
+    @override
+    def _initialize_spec_state(self) -> Mamba2State | ReplayHistory | Mamba2ExactReplayState:
+        replay_state = self._exact_replay_state()
+        if replay_state is not None:
+            return replay_state
         if self._requested_replay is not None:
             state = create_mamba2_state(
                 spec_config=self.spec_config,
@@ -539,10 +671,12 @@ def get_nemotron_cache_params(config, *, spec_config=None, quant_config=None):
         target_full_attn_mask=[layer == "*" for layer in pattern],
         spec_config=spec_config,
         quant_config=quant_config,
+        chunk_size=getattr(config, "chunk_size", None),
     )
 
 
 __all__ = [
+    "Mamba2ExactReplayState",
     "Mamba2LayerCache",
     "Mamba2State",
     "ReplayHistory",
