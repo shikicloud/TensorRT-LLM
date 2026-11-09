@@ -25,7 +25,7 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from tensorrt_llm._torch.modules.fla.utils import tensor_cache
-from tensorrt_llm._utils import is_flashinfer_gdn_prefill_supported_arch, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_flashinfer_gdn_prefill_supported_arch, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -1234,6 +1234,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             and os.getenv("FORCE_DETERMINISTIC", "0") == "1"
         )
         inforward_split = kwargs.get("inforward_split")
+        # Prefill through the decode recurrence so q/k normalization and the
+        # state update use the same FP32 arithmetic at every prefill/decode
+        # boundary. Needs the FP32 state pool and no in-forward snapshot.
+        deterministic_prefill = (
+            not is_target_verify
+            and inforward_split is None
+            and ssm_states.dtype == torch.float32
+            and os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+            and get_sm_version() in (100, 103)
+        )
 
         conv_states_to_use = conv_states
         if inforward_split is not None:
@@ -1301,6 +1311,36 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     activation=self.activation,
                     conv_state_indices=state_indices_d,
                 )
+            if deterministic_prefill:
+                # _recurrent_update reads each prefill request's initial state
+                # from ssm_states[state_indices_p] without consulting
+                # has_initial_states_p. That is correct only because
+                # forward_core zeroed the fresh slots with
+                # reset_recurrent_state_rows before this call; a caller that
+                # skips forward_core would reuse stale state.
+                output_p = output[:, :num_prefill_tokens] if output is not None else None
+                prefill_out = self._recurrent_update(
+                    mixed_qkv_p_t.transpose(0, 1).contiguous(),
+                    a[:num_prefill_tokens],
+                    b[:num_prefill_tokens],
+                    ssm_states,
+                    state_indices_p,
+                    _prefill_query_start_loc(query_start_loc_long, num_prefill),
+                    output_p,
+                )
+                output_d = output[:, num_prefill_tokens:] if output is not None else None
+                decode_out = self._recurrent_update(
+                    mixed_qkv_d,
+                    a[num_prefill_tokens:],
+                    b[num_prefill_tokens:],
+                    ssm_states,
+                    state_indices_d,
+                    query_start_loc_long[num_prefill:] - num_prefill_tokens,
+                    output_d,
+                )
+                if output is not None:
+                    return output
+                return torch.cat((prefill_out, decode_out), dim=1)
             if is_target_verify:
                 if num_prefill_tokens > 0:
                     query_p, key_p, value_p, g_p, beta_p = fused_gdn_post_conv(
@@ -1370,6 +1410,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             if inforward_split is not None:
                 _inforward_split_conv_states(
                     conv_states, inforward_window, inforward_split, kwargs["inforward_stage"][1]
+                )
+            if deterministic_prefill:
+                # The initial state is read from ssm_states[cache_indices]
+                # without consulting has_initial_states; forward_core zeroed the
+                # fresh slots with reset_recurrent_state_rows before this call.
+                return self._recurrent_update(
+                    mixed_qkv_t.transpose(0, 1).contiguous(),
+                    a,
+                    b,
+                    ssm_states,
+                    cache_indices,
+                    query_start_loc_long,
+                    output,
                 )
             query, key, value, g, beta = fused_gdn_post_conv(
                 mixed_qkv_t,
